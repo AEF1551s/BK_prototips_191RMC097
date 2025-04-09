@@ -1,0 +1,169 @@
+import pygame
+from OpenGL.GL import *
+from OpenGL.GLUT import *
+from OpenGL.GLU import *
+import time
+from capture import FrameCapture, YUV422toBGR, YUV422toRGB, openSharedMemory
+import cv2
+import cv2.cuda
+import numpy as np
+from yolox.tracker.byte_tracker import BYTETracker
+from mmdeploy_runtime import Detector
+import torch
+width, height = 736, 416
+info_imgs = [width, height]
+def clamp_tlbr(tlbr, image_width, image_height):
+    top    = max(0, min(tlbr[1], image_height-1))
+    left   = max(0, min(tlbr[0], image_width-1))
+    bottom = max(top, min(tlbr[2], image_height-1))
+    right  = max(left, min(tlbr[3], image_width-1))
+    return [top, left, bottom, right]
+def init_gui():
+    pygame.init()
+    pygame.display.set_mode((width, height), pygame.OPENGL | pygame.DOUBLEBUF)
+    glClearColor(0.0, 0.0, 0.0, 1.0)
+    glOrtho(0, width, height, 0, -1, 1)
+def draw_image(frame):
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+    flipped_ud_img = np.flipud(frame)
+    glDrawPixels(width, height, GL_RGB, GL_UNSIGNED_BYTE, flipped_ud_img)
+    pygame.display.flip()
+def draw_rectangle_np(image, left, top, right, bottom, color=(0, 255, 0)):
+    image[top:bottom, left] = color  
+    image[top:bottom, right] = color  
+    image[top, left:right] = color  
+    image[bottom, left:right] = color 
+def draw_text_in_bbox(image, text, left, top, right, bottom, font_scale=0.5, color=(0, 255, 0), thickness=1):
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    cv2.putText(image, text, (left, top +30), font, font_scale, color, thickness, cv2.LINE_AA)
+init_gui()
+frameCapture = FrameCapture()
+label_map = {
+    0: 'person',
+    1: 'bicycle',
+    2: 'car',
+    3: 'motorbike',
+    4: 'airplane',
+    5: 'bus',
+    6: 'train',
+    7: 'truck',
+    8: 'boat',
+    9: 'traffic light',
+    10: 'fire hydrant',
+    11: 'stop sign',
+    12: 'parking meter',
+    13: 'bench',
+    14: 'bird',
+    15: 'cat',
+    16: 'dog',
+    17: 'horse',
+    18: 'sheep',
+    19: 'cow',
+    20: 'elephant',
+    21: 'bear',
+    22: 'zebra',
+    23: 'giraffe',
+    24: 'hat',
+    25: 'backpack',
+    26: 'umbrella',
+    27: 'handbag',
+    28: 'tie',
+    29: 'suitcase',
+    30: 'frisbee',
+    31: 'skis',
+    32: 'snowboard',
+    33: 'sports ball',
+    34: 'kite',
+    35: 'baseball bat',
+    36: 'baseball glove',
+    37: 'skateboard',
+    38: 'surfboard',
+    39: 'tennis racket',
+    40: 'bottle',
+    41: 'wine glass',
+    42: 'cup',
+    43: 'fork',
+    44: 'knife',
+    45: 'spoon',
+    46: 'bowl',
+    47: 'banana',
+    48: 'apple',
+    49: 'sandwich',
+    50: 'orange',
+    51: 'broccoli',
+    52: 'carrot',
+    53: 'hot dog',
+    54: 'pizza',
+    55: 'donut',
+    56: 'cake',
+    57: 'chair',
+    58: 'couch',
+    59: 'potted plant',
+    60: 'bed',
+    61: 'dining table',
+    62: 'toilet',
+    63: 'tv',
+    64: 'laptop',
+    65: 'mouse',
+    66: 'remote',
+    67: 'keyboard',
+    68: 'cell phone',
+    69: 'microwave',
+    70: 'oven',
+    71: 'toaster',
+    72: 'sink',
+    73: 'refrigerator',
+    74: 'book',
+    75: 'clock',
+    76: 'vase',
+    77: 'scissors',
+    78: 'teddy bear',
+    79: 'hair drier',
+    80: 'toothbrush'
+}
+def get_label_name(label_id):
+    return label_map.get(label_id, "Unknown")
+class BYTE_args:
+    track_thresh = 0.6
+    track_buffer = 2000
+    match_thresh = 0.8
+    min_box_area = 10
+    mot20 = False
+track_args = BYTE_args()
+det_threshold = 0.5
+count = 0
+total = 0
+detector = Detector(model_path='models/conversions/cascade_rcnn/int8', device_name='cuda', device_id=0)
+tracker = BYTETracker(track_args,frame_rate=20)
+result_file = open("results/test_results.txt", "w")
+while True:
+    count+=1
+    start_time_system = time.perf_counter()
+    pygame.event.poll()
+    frameCapture.captureRawFrame()
+    orig_img_rgb = frameCapture.getRGBFrame()
+    ar_image = cv2.resize(orig_img_rgb,(width,height))
+    with torch.no_grad():
+        bboxes, labels, mask = detector(ar_image) #left, top, right, buttom
+    threshold_bboxes = bboxes[bboxes[:, 4] > det_threshold]
+    online_targets = tracker.update(threshold_bboxes, (height, width), (height,width))    
+    online_tlwhs = []
+    online_ids = []
+    online_scores = []
+    for t in online_targets:
+        tlwh = t.tlwh
+        tid = t.track_id
+        vertical = tlwh[2] / tlwh[3] > 1.6
+        if tlwh[2] * tlwh[3] > track_args.min_box_area and not vertical:
+            online_tlwhs.append(tlwh)
+            online_ids.append(tid)
+            online_scores.append(t.score)
+            draw_rectangle_np(ar_image, max(0, min(width-1, int(tlwh[0]))), 
+                              max(0,min(height,int(tlwh[1]))), 
+                              min(width-1, int(tlwh[2])+int(tlwh[0])), 
+                              min(height-1,int(tlwh[3])+int(tlwh[1])))
+            draw_text_in_bbox(ar_image, f"ID: {tid} S: {t.score:.2f}" , int(tlwh[0]), int(tlwh[1]), int(tlwh[2])+int(tlwh[0]), int(tlwh[3])+int(tlwh[1]))
+    draw_image(ar_image)
+    end_time_system = time.perf_counter()
+    total_time_system = end_time_system-start_time_system
+    result_file.write(str(total_time_system)+"\n")
